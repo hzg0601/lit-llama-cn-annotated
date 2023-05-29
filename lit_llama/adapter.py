@@ -2,6 +2,16 @@
 
 LLaMA-Adapter: Efficient Fine-tuning of Language Models with Zero-init Attention
 https://arxiv.org/abs/2303.16199
+
+在每条输入前，都增加了一个prefix，计算prefix对输入的注意力得分，并计算对输入的注意力值矩阵，
+加入到原始的注意力值矩阵中，作为最终的输出；
+
+v2增加了new bias and scale used in Linear，and RMSNorm parameters are now trainable
+def adapter_v2_new_forward(self, input: Tensor) -> Tensor:
+    return self.adapter_scale * (
+        F.linear(input, self.weight, self.bias) + self.adapter_bias
+    )
+
 """
 # mypy: ignore-errors
 from dataclasses import dataclass
@@ -57,6 +67,17 @@ class CausalSelfAttention(nn.Module):
         kv_cache: Optional[KVCache] = None,
         adapter_kv_cache: Optional[KVCache] = None,
     ) -> Tuple[torch.Tensor, Optional[KVCache], Optional[KVCache]]:
+        """
+        1. 先正常进行q,k,v的投影和多头划分；
+        2. 如果input_pos> max_seq_length,则向左roll一位；
+        3. 在每次更新中只更新前max(max_seq_length-1, input_pos)位置的值；
+        4. 正常执行注意力计算，得到一个(B,n_head, T, head_size)的值矩阵y;
+        5. 在输入的头部注入一个长度为adapter_prompt_length的prefix,对prefix执行q,k,v投影得到ak,av;
+        6. 计算ak对q的注意力得分，并计算adapter对q的注意力值矩阵ay;
+        7. 将ay的值加入y中；
+        8. 拼接多头注意力，执行output projection，并返回注意力值矩阵；
+
+        """
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
@@ -67,7 +88,7 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, head_size)
         v = v.view(B, T, self.n_head, head_size)
 
-        q = apply_rope(q, rope)
+        q = apply_rope(q, rope) # truncate to support variable sizes
         k = apply_rope(k, rope)
 
         k = k.transpose(1, 2)  # (B, nh, T, hs)
@@ -77,12 +98,16 @@ class CausalSelfAttention(nn.Module):
         if kv_cache is not None:
             cache_k, cache_v = kv_cache
             # check if reached token limit
+            # 如果input_pos为一个值>max_seq_length,更新input_pos的值为max_seq_length-1
+            # 并沿着seq_length的维度，向左移动一个位置 #? 将cls的token放到尾部
             if input_pos[-1] >= max_seq_length:
                 input_pos = torch.tensor(max_seq_length - 1, device=input_pos.device)
                 # shift 1 position to the left
-                cache_k = torch.roll(cache_k, -1, dims=2)
+                cache_k = torch.roll(cache_k, -1, dims=2) #torch.roll(inputs,shifts,dims) 沿着给定的维度dims,将tensor滚动shifts个位置
                 cache_v = torch.roll(cache_v, -1, dims=2)
-            k = cache_k.index_copy(2, input_pos, k)
+            # 将新计算的k中input_pos位置的值复制给cache_k，并令其为新的cache_k
+            # 如此在每次更新中只更新max(max_seq_length-1, input_pos)位置的值
+            k = cache_k.index_copy(2, input_pos, k) # index_copy(dim,index,tensor),沿指定的dim按 index 中给出的顺序选择索引，将 tensor 的元素复制到 self 张量中
             v = cache_v.index_copy(2, input_pos, v)
             kv_cache = k, v
 
@@ -93,14 +118,19 @@ class CausalSelfAttention(nn.Module):
             if adapter_kv_cache is not None:
                 ak, av = adapter_kv_cache
             else:
+                # adapter embedding layer=nn.Embedding(config.adapter_prompt_length, config.n_embd)
                 prefix = self.adapter_wte.weight.reshape(1, self.adapter_prompt_length, self.n_embd)
                 aT = prefix.size(1)
+                # 一次性进行q,k,v投影
                 _, ak, av = self.c_attn(prefix).split(self.n_embd, dim=2)
-                ak = ak.view(1, aT, self.n_head, head_size).repeat(B, 1, 1, 1).transpose(1, 2)
+                # 然后划分多头，复制B分，交换第2,3维->(B,n_head,adapter_prompt_length,head_size)
+                ak = ak.view(1, aT, self.n_head, head_size).repeat(B, 1, 1, 1).transpose(1, 2) 
                 av = av.view(1, aT, self.n_head, head_size).repeat(B, 1, 1, 1).transpose(1, 2)
                 adapter_kv_cache = (ak, av)
-
+            # amask -> (T,adapter_prompt_length), q ->(B,n_head, T, head_size), ak -> (B,n_head,adapter_prompt_length,head_size)
             amask = torch.ones(q.shape[-2], ak.shape[-2], dtype=torch.bool, device=x.device)
+            # q @ ak^T -> (B,n_head,T,aT)  @ av (B,n_head,aT,head_size) -> (B,n_head, T, head_size)
+            # attn_mask在进行softmax时需要计算的值
             ay = F.scaled_dot_product_attention(q, ak, av, attn_mask=amask, dropout_p=0.0, is_causal=False)
             y = y + self.gating_factor * ay
 
@@ -132,7 +162,14 @@ class Block(nn.Module):
         input_pos: Optional[torch.Tensor] = None,
         kv_cache: Optional[KVCache] = None,
         adapter_kv_cache: Optional[KVCache] = None,
-    ) -> Tuple[torch.Tensor, Optional[KVCache], Optional[KVCache]]:
+        ) -> Tuple[torch.Tensor, Optional[KVCache], Optional[KVCache]]:
+        """
+        1. 先对x进行norm;
+        2. 再对norm(x)进行mha得到h;
+        3. x+h 更新x;
+        4. mlp(norm(x+h)) +(x+h);
+        与原始的架构图相比，add和norm分离了，norm提前了。
+        """
         h, new_kv_cache, new_adapter_kv_cache = self.attn(
             self.rms_1(x), rope, mask, max_seq_length, input_pos, kv_cache, adapter_kv_cache
         )

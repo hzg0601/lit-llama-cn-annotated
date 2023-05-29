@@ -5,6 +5,10 @@
 #  ------------------------------------------------------------------------------------------
 
 r"""
+    1. 允许选择只对q,k,v的部分投影层执行更新；
+    2. 主方法有两个,train和forward,train用于计算与原始权重维度相同的的更新后的权重，forward用于计算更新后权重的输入的投影；
+    3. LoRA方法只用于q,k,v的投影层，作为q,k,v投影层的一个旁路，因此并不对TransformerBlock的position_wise forward层进行处理;
+    4. 核心类为MergedLinear，其作为q,k,v投影操作的旁路，本脚本还定义了mark_only_lora_as_trainable，lora_state_dict等方法用于确定更新和保存的权重。
     Low Ranking Adaptation for LLMs scheme.
 
              ┌───────────────────┐
@@ -39,6 +43,7 @@ pretrained weights and thus finetune the model.
 
 The goal of this approach is to move weight updates into a separate matrix which is decomposed with
 two matrices of a lower rank.
+
 """
 
 import torch
@@ -130,6 +135,10 @@ class MergedLinear(nn.Linear, LoRALayer):
             merge_weights: whether we want to merge pretrained weights and LoRA weight updates. This is useful if one wants to use
                 finetuned model as a standalone one (without storing LoRA weight separately) plus it helps to reduce
                 overhead during inference.
+            1. 允许选择只对q,k,v的部分投影层执行更新；
+            2. 主方法有两个,train和forward,train用于计算与原始权重维度相同的的更新后的权重，forward用于计算更新后权重的输入的投影；
+            3. LoRA方法只用于q,k,v的投影层，作为q,k,v投影层的一个旁路，因此并不对TransformerBlock的position_wise forward层进行处理
+
         """
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
@@ -182,11 +191,15 @@ class MergedLinear(nn.Linear, LoRALayer):
             # ________________________________________
             # | query         | key       | value    |
             # ----------------------------------------
+            # torch.tensor() 用的最多，一般都用它；
+            # torch.* 用于创建特殊形式的 tensor，包括 torch.ones()、torch.zeros()等；
+            # torch.*_like() 用于创建一个与已知 tensor 形状相同的 tensor；
+            # torch.new_* 用于创建一个与已知 tensor 类型相同的 tensor
             self.lora_ind = self.weight.new_zeros(
                 (out_features, ), dtype=torch.bool
             ).view(len(enable_lora), -1)  # (3, 128)
-            self.lora_ind[enable_lora, :] = True  # (3, 128)
-            self.lora_ind = self.lora_ind.view(-1)  # (384,)
+            self.lora_ind[enable_lora, :] = True  # (3, 128)，key行为0，其他行为1
+            self.lora_ind = self.lora_ind.view(-1)  # (384,),转换为与out_feature相同的维度，可视为out的掩码矩阵
         self.reset_parameters()
         if fan_in_fan_out:
             self.weight.data = self.weight.data.T
@@ -230,12 +243,12 @@ class MergedLinear(nn.Linear, LoRALayer):
         # only for key updates (this is where self.lora_ind comes in handy)
         # Note: double transpose (in the beginning and in the end) is basically a guard for two-dimensional tensors
         # for example when we want to merge/unmerge LoRA weights and pretrained weights
-        x = x.transpose(0, 1)
+        x = x.transpose(0, 1) # x只包含q,k,v中待更新的组的值
         result = x.new_zeros((*x.shape[:-1], self.out_features))  # (64, 64, 384)
         result = result.view(-1, self.out_features)  # (4096, 384)
         result[:, self.lora_ind] = x.reshape(
             -1, self.out_features // len(self.enable_lora) * sum(self.enable_lora)
-        )  # (4096, 256)
+        )  # (4096, 256)，令执行更新的组的值等于x对应位置的值，其他位置仍为0
         return result.view((*x.shape[:-1], self.out_features)).transpose(0, 1)  # (64, 64, 384)
 
     def train(self, mode: bool = True):
@@ -267,12 +280,17 @@ class MergedLinear(nn.Linear, LoRALayer):
         # ⚬ self.lora_B.data: (256, 2)
         if self.merge_weights and should:
             if self.r > 0 and any(self.enable_lora):
+                # input:(B,C_i,L_i),weight:(C_k,C_i/groups,L_k)-> (B,C_o,L_o),其中C_o=C_k, L_k=|(L_i-L_k+1-2^(dilation-1))/stride|
+                # 样本按通道分为groups组,卷积核按通道分为groups组，--> (B,C_i/groups,L_i)*groups, (C_k/groups,C_i/groups,L_k)*groups
+                # 每一组执行卷积操作，(B,C_k/groups,|(L_i-L_k+1-2^(dilation-1))/stride|), 相当于(C_i/groups,L_k)为一个卷积核,共C_k/groups个卷积核
+                # 然后拼接 -> (B,C_k,|(L_i-L_k+1-2^(dilation-1))/stride|)
+                # 
                 delta_w = F.conv1d(
                     self.lora_A.data.unsqueeze(0),   # (4, 128) -> (1, 4, 128)
                     self.lora_B.data.unsqueeze(-1),  # (256, 2) -> (256, 2, 1)
                     groups=sum(self.enable_lora)
                 ).squeeze(0) # (1, 4, 128) @ (256, 2, 1) -> (1, 256, 128) -> (256, 128)
-                # -1: W = W - delta_W (unmerge), +1: W = W + delta_W (merge)
+                #! -1: W = W - delta_W (unmerge), +1: W = W + delta_W (merge)
                 sign = -1 if mode else 1
                 self.weight.data += sign * self.zero_pad(T(delta_w * self.scaling)) # (256, 128) after zero_pad (384, 128)
             self.merged = not mode
@@ -282,7 +300,7 @@ class MergedLinear(nn.Linear, LoRALayer):
 
         If LoRA's weights are merged with pretrained ones then it's a simple matrix multiplication.
         If not, then multiply pretrained weights with input, apply LoRA on input and do summation.
-
+        执行前向推理，result = 线性投影+x@A@B
         Args:
             x: input tensor of shape (batch_size, context_length, embedding_size)
 
@@ -409,7 +427,7 @@ class CausalSelfAttention(llama.CausalSelfAttention):
 
         *Instead of creating multiple heads and concatenating the result (in addition to creating separate matrices for
         query, key and value for each head) we can do this in a single pass with a single weight matrix.
-
+        LoRA只执行一次q,k,v投影，然后执行多头注意力机制，标准模式；意味着可能存在以多次q,k,v投影的方式执行多头注意力的方式
         Args:
             config: 
                 ``"block_size"``: size of the context of the model,

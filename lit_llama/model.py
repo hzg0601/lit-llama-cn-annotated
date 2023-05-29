@@ -311,7 +311,7 @@ def apply_rope(x: torch.Tensor, rope_cache: RoPECache) -> torch.Tensor:
     rope_cache = rope_cache.view(1, xshaped.size(1), 1, xshaped.size(3), 2)
     x_out2 = torch.stack(
         [
-            xshaped[..., 0] * rope_cache[..., 0] - xshaped[..., 1] * rope_cache[..., 1],
+            xshaped[..., 0] * rope_cache[..., 0] - xshaped[..., 1] * rope_cache[..., 1], #xshaped[...,0] = xshaped[:,:,0]
             xshaped[..., 1] * rope_cache[..., 0] + xshaped[..., 0] * rope_cache[..., 1],
         ],
         -1,
