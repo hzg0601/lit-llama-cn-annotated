@@ -5,6 +5,22 @@
 #  ------------------------------------------------------------------------------------------
 
 r"""
+        LoRA的核心思想就是用两个低秩矩阵替代q,k,v投影层，
+        在训练时，以conv1d即分组矩阵乘法得到delta_w,以w-delta_w执行参数更新
+        在推理时，将输入先乘以lora_A，再执行分组矩阵乘法，得分delta_y,y+delta_y得到最终输出。
+        
+        1. 类参数里包含了lora嵌入维度r和待更新的注意力投影组enable_lora，允许只对q,k,v投影层的部分层进行训练；
+        2. 根据lora嵌入维度r和待更新的注意力投影组enable_lora,定义lora_A和lora_B层；
+        3. 定义scaling参数=lora_alpha/r;
+        4. 根据enable_lora参数和out_features定义lora参数更新组的掩码矩阵lora_ind;
+        5. 在训练时，对lora_A,lora_B的权重执行conv1d，即执行分组的矩阵乘法，得到真实待更新的参数矩阵delta_w；
+        6. delta_w * scaling，然后执行zero_padding，转换为完整形式的参数矩阵，mode为true,则w-delta_w；否则执行w+delta_w；
+        7. 在执行前向推理时，先将输入乘以lora_A得到after_A，再对after_A，lora_B执行conv1d，即分组矩阵乘法，得到after_B，
+            在将输入乘以原始权重矩阵，得到原始输出，
+        8. 对after_B*scaling，然后执行zero_padding，加入到原始输出中，得到最终输出。
+
+        以上步骤构成一个改造的注意力投影层，LoRA仅用于替代注意力投影层，只执行一次q,k,v投影，然后执行多头注意力机制。
+
     1. 允许选择只对q,k,v的部分投影层执行更新；
     2. 主方法有两个,train和forward,train用于计算与原始权重维度相同的的更新后的权重，forward用于计算更新后权重的输入的投影；
     3. LoRA方法只用于q,k,v的投影层，作为q,k,v投影层的一个旁路，因此并不对TransformerBlock的position_wise forward层进行处理;
@@ -139,6 +155,16 @@ class MergedLinear(nn.Linear, LoRALayer):
             2. 主方法有两个,train和forward,train用于计算与原始权重维度相同的的更新后的权重，forward用于计算更新后权重的输入的投影；
             3. LoRA方法只用于q,k,v的投影层，作为q,k,v投影层的一个旁路，因此并不对TransformerBlock的position_wise forward层进行处理
 
+        1. 类参数里包含了lora嵌入维度r和待更新的注意力投影组enable_lora，允许只对q,k,v投影层的部分层进行训练；
+        2. 根据lora嵌入维度r和待更新的注意力投影组enable_lora,定义lora_A和lora_B层；
+        3. 定义scaling参数=lora_alpha/r;
+        4. 根据enable_lora参数和out_features定义lora参数更新组的掩码矩阵lora_ind;
+        5. 在训练时，对lora_A,lora_B的权重执行conv1d，即执行分组的矩阵乘法，得到真实待更新的参数矩阵delta_w；
+        6. delta_w * scaling，然后执行zero_padding，转换为完整形式的参数矩阵，mode为ture,则w-delta_w；否则执行w+delta_w；
+        7. 在执行前向推理时，先将输入乘以lora_A得到after_A，再对after_A，lora_B执行conv1d，即分组矩阵乘法，得到after_B，
+            在将输入乘以原始权重矩阵，得到原始输出，
+        8. 对after_B*scaling，然后执行zero_padding，加入到原始输出中，得到最终输出。
+
         """
         nn.Linear.__init__(self, in_features, out_features, **kwargs)
         LoRALayer.__init__(self, r=r, lora_alpha=lora_alpha, lora_dropout=lora_dropout,
@@ -232,9 +258,15 @@ class MergedLinear(nn.Linear, LoRALayer):
 
         Returns:
             A tensor with weight updates and zeros for diselected q, k or v
+        对更新后的参数组进行zero padding，将其变回完整的q,k,v组的参数矩阵（例如，原像可能只包含q,v参数组）；
+        1. 交换x的第0,1维，
+        2. 构造一个除最后一维外其他与x一致的zero数组result;
+        3. result前维合并，变成二维;
+        4. 根据lora_ind的mask信息，将x的信息复制到result中；
+        5. 根据x的信息，将前维一致，后维为out_features的数组。
         """
         # Let's image that:
-        # ⚬ intput x has shape (64, 64, 256): (batch_size, sequence_length, embeddings_size)
+        # ⚬ input x has shape (64, 64, 256): (batch_size, sequence_length, embeddings_size)
         # ⚬ embeddings_size: 128
         # ⚬ self.out_features: 384 (3 * embeddings_size)
         # ⚬ enable_lora: [True, False, True]
@@ -243,6 +275,7 @@ class MergedLinear(nn.Linear, LoRALayer):
         # only for key updates (this is where self.lora_ind comes in handy)
         # Note: double transpose (in the beginning and in the end) is basically a guard for two-dimensional tensors
         # for example when we want to merge/unmerge LoRA weights and pretrained weights
+
         x = x.transpose(0, 1) # x只包含q,k,v中待更新的组的值
         result = x.new_zeros((*x.shape[:-1], self.out_features))  # (64, 64, 384)
         result = result.view(-1, self.out_features)  # (4096, 384)
