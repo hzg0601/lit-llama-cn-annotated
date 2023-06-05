@@ -6,6 +6,14 @@ https://arxiv.org/abs/2303.16199
 在每条输入前，都增加了一个prefix，计算prefix对输入的注意力得分，并计算对输入的注意力值矩阵，
 加入到原始的注意力值矩阵中，作为最终的输出；
 
+lora: 注意力机制之前，用两个低秩矩阵替代q,k,v投影矩阵；
+adapter: 注意力机制中，在每条输入前，都增加了一个prefix，prefix参与注意力的技术，将计算得到的prefix的注意力值加入到注意力结果中；
+prefix: 不参与注意力流程中，直接在输入中加入任务相关的virtual token，对virtual token进行embedding, 如有必要再加入一层MLP；
+p-tuning:  不参与注意力流程中，直接在输入中加入任务相关的virtual token，对virtual token进行embedding,然后再使用LSTM或MLP对embedding进行重新参数化
+prompt:  不参与注意力流程中，直接在输入中加入任务相关的virtual token，定义virtual token的embedding, 
+        使用基础模型的词嵌入层对初始文本tokenized进行嵌入，转换为float32位，设为可训练参数，赋值给virtual token的embedding作为其权重，
+        前向推理时只需获取给定虚拟token索引对应的嵌入向量。
+
 v2增加了new bias and scale used in Linear，and RMSNorm parameters are now trainable
 def adapter_v2_new_forward(self, input: Tensor) -> Tensor:
     return self.adapter_scale * (
